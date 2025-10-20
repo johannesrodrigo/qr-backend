@@ -1,157 +1,146 @@
-import os, io, re, time, base64, hmac, hashlib, unicodedata
+import hmac, hashlib, base64, io, os, time
 from typing import Optional
-import requests, pandas as pd
-from fastapi import FastAPI, Query, Response
-from fastapi.responses import HTMLResponse, PlainTextResponse
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
+import requests
+from openpyxl import load_workbook
 
-# ======== Config por variables de entorno =========
-SECRET_KEY = os.environ.get("SECRET_KEY", "").encode("utf-8")   # OBLIGATORIO
-ONEDRIVE_URL = os.environ.get("ONEDRIVE_URL", "")               # OBLIGATORIO
-SHEET_NAME   = os.environ.get("SHEET_NAME", "")                 # opcional (vacío = 1ra hoja)
-HEADER_ROW   = int(os.environ.get("HEADER_ROW", "12"))          # 1-based (tú usas 12)
-CACHE_TTL    = int(os.environ.get("CACHE_TTL", "60"))           # segundos
-ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")          # para permitir tu GitHub Pages
+app = FastAPI(title="QR Backend (sin pandas)", version="1.0.0")
 
-if not SECRET_KEY or not ONEDRIVE_URL:
-    raise RuntimeError("Faltan SECRET_KEY u ONEDRIVE_URL en variables de entorno.")
-
-# ======== Utilidades ========
-def b64url(b: bytes) -> str:
-    return base64.urlsafe_b64encode(b).decode().rstrip("=")
-
-def normalize_doc(s: str) -> str:
-    s = (s or "").strip().upper()
-    return re.sub(r"[^A-Z0-9]", "", s)
-
-def strip_accents(s: str) -> str:
-    if not isinstance(s, str): return str(s)
-    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
-
-def norm_header(s: str) -> str:
-    s = strip_accents((s or "").strip().upper())
-    s = re.sub(r"\s+", " ", s)
-    return s
+# ===== utilidades =====
 
 def od_to_download(url: str) -> str:
-    u = (url or "").strip()
-    if not u.lower().startswith(("http://","https://")): u = "https://" + u
-    if "sharepoint.com" in u:
-        if "?web=1" in u: u = u.replace("?web=1","?download=1")
-        elif "download=1" not in u: u = f"{u}{'&' if '?' in u else '?'}download=1"
-    elif "onedrive.live.com" in u:
-        u = u.replace("redir","download").replace("view.aspx","download.aspx")
-        if "download=1" not in u: u = f"{u}{'&' if '?' in u else '?'}download=1"
-    return u
+    """Convierte el link de 'Compartir' de OneDrive/SharePoint a URL de descarga directa."""
+    if "sharepoint.com" in url or "my.sharepoint.com" in url:
+        # SharePoint: agregar &download=1
+        return url + ("&download=1" if "?" in url else "?download=1")
+    if "1drv.ms" in url or "onedrive.live.com" in url:
+        # Live/short: agregar &download=1 (simple)
+        return url + ("&download=1" if "?" in url else "?download=1")
+    return url
 
-# ======== Cache del DataFrame ========
-_df_cache = None
-_df_at = 0.0
-
-def load_df(force: bool=False) -> pd.DataFrame:
-    global _df_cache, _df_at
-    now = time.time()
-    if (not force) and _df_cache is not None and (now - _df_at) < CACHE_TTL:
-        return _df_cache
-    url = od_to_download(ONEDRIVE_URL)
-    url = f"{url}{'&' if '?' in url else '?'}_cb={int(now)}"
-    r = requests.get(url, timeout=60, headers={"Cache-Control":"no-cache"})
-    r.raise_for_status()
-    ct = r.headers.get("content-type","").lower()
-    if ("html" in ct) or (not r.content[:2]==b"PK" and "spreadsheetml" not in ct):
-        sample = r.text[:200].replace("\n"," ")
-        raise RuntimeError(f"El vínculo de OneDrive no devolvió XLSX. Content-Type={ct}. Muestra: {sample}")
-    df = pd.read_excel(io.BytesIO(r.content),
-                       sheet_name=(SHEET_NAME if SHEET_NAME else 0),
-                       engine="openpyxl",
-                       header=HEADER_ROW-1)
-    _df_cache, _df_at = df, now
-    return df
-
-# ======== Detección de columnas por encabezado ========
-NAME_H = "NOMBRES Y APELLIDOS"
-DOC_H  = "DNI / CE"
-VIG_H  = "FECHA DE VIGENCIA DE HABILITACION DE LICENCIA INTERNA"
-EST_H  = "ESTATUS DE PROCESO DE HABILITACION"
-
-def detect_cols(df: pd.DataFrame):
-    cols_norm = {i: norm_header(str(c)) for i,c in enumerate(df.columns)}
-    name_idx = doc_idx = vig_idx = est_idx = None
-    for i,h in cols_norm.items():
-        if h == norm_header(NAME_H): name_idx = i
-        if h == norm_header(DOC_H):  doc_idx  = i
-        if h == norm_header(VIG_H):  vig_idx  = i
-        if h == norm_header(EST_H):  est_idx  = i
-    # Fallback (0-based): D=3, E=4, AF=31, AG=32
-    name_idx = 3  if name_idx is None else name_idx
-    doc_idx  = 4  if doc_idx  is None else doc_idx
-    vig_idx  = 31 if vig_idx  is None else vig_idx
-    est_idx  = 32 if est_idx  is None else est_idx
-    return name_idx, doc_idx, vig_idx, est_idx
-
-def val(row, idx):
+def secure_eq(a: str, b: str) -> bool:
     try:
-        import pandas as pd
-        v = row.iloc[idx]
-        if pd.isna(v): return ""
-        return str(v).strip()
-    except:
+        return hmac.compare_digest(a.encode(), b.encode())
+    except Exception:
+        return False
+
+def sign(doc: str, secret_key: str) -> str:
+    mac = hmac.new(secret_key.encode(), doc.encode(), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(mac).decode().rstrip("=")
+
+def verify(doc: str, t: str, secret_key: str) -> bool:
+    try:
+        expected = sign(doc, secret_key)
+        # normalizar padding de base64 urlsafe
+        return secure_eq(t, expected)
+    except Exception:
+        return False
+
+def normalize(s: Optional[str]) -> str:
+    if s is None:
         return ""
+    return " ".join(str(s).strip().split()).upper()
 
-# ======== FastAPI ========
-app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[ALLOWED_ORIGIN] if ALLOWED_ORIGIN!="*" else ["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ===== lectura Excel SIN pandas =====
 
-@app.get("/", response_class=PlainTextResponse)
-def health():
-    return "OK"
-
-@app.get("/driver", response_class=HTMLResponse)
-def driver(doc: str = Query(...), t: str = Query(...), nocache: Optional[int] = 0):
-    ndoc = normalize_doc(doc)
-    mac  = hmac.new(SECRET_KEY, ndoc.encode("utf-8"), hashlib.sha256).digest()
-    if t != b64url(mac):
-        return Response("Token inválido", status_code=403)
-
-    df = load_df(force=bool(nocache))
-    name_idx, doc_idx, vig_idx, est_idx = detect_cols(df)
-
-    matches = df[df.iloc[:, doc_idx].apply(lambda x: normalize_doc("" if pd.isna(x) else str(x))) == ndoc]
-    if matches.empty:
-        return Response("No se encontró al conductor.", status_code=404)
-
-    row = matches.iloc[0]
-    nombres = val(row, name_idx)
-    dni_ce  = val(row, doc_idx)
-    vig     = val(row, vig_idx)
-    est     = val(row, est_idx)
-
-    html = f"""
-    <!doctype html><meta charset="utf-8">
-    <style>
-      :root {{ --bg:#0b0b0b; --card:#1f2937; --muted:#9ca3af; --fg:#e5e7eb; --pill:#111827; --pillbd:#334155; }}
-      body{{margin:0;padding:20px;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif}}
-      .card{{max-width:720px;margin:0 auto;border-radius:16px;padding:24px;border:1px solid #374151;background:var(--card);box-shadow:0 2px 16px rgba(0,0,0,.25)}}
-      h1{{margin:0 0 18px;font-size:28px;font-weight:800}}
-      .row{{display:flex;justify-content:space-between;gap:16px;padding:12px 0;border-bottom:1px solid #374151}}
-      .k{{color:var(--muted);letter-spacing:.5px}}
-      .v{{font-weight:800;white-space:pre-line}}
-      .pill{{display:inline-block;padding:6px 12px;border-radius:999px;border:1px solid var(--pillbd);background:var(--pill);font-weight:800}}
-      .foot{{margin-top:14px;color:var(--muted);font-size:14px}}
-    </style>
-    <div class="card">
-      <h1>Información del Conductor</h1>
-      <div class="row"><div class="k">NOMBRES Y APELLIDOS</div><div class="v">{(nombres or '-').replace('\\n','<br>')}</div></div>
-      <div class="row"><div class="k">DNI / CE</div><div class="v">{dni_ce or '-'}</div></div>
-      <div class="row"><div class="k">FECHA DE VIGENCIA DE HABILITACIÓN DE LICENCIA INTERNA</div><div class="v">{vig or '-'}</div></div>
-      <div class="row"><div class="k">ESTATUS DE PROCESO DE HABILITACION</div><div class="v"><span class="pill">{est or '-'}</span></div></div>
-      <div class="foot">Fuente consultada en tiempo real. TTL caché: {CACHE_TTL}s. Fila encabezados: {HEADER_ROW}.</div>
-    </div>
+def read_driver_from_excel(
+    xls_bytes: bytes,
+    sheet_name: Optional[str],
+    header_row_1based: int,
+    dni_value: str,
+) -> dict:
     """
-    return HTMLResponse(html)
+    Lee el Excel y devuelve el registro del conductor por DNI de la COLUMNA E,
+    y extrae: D (NOMBRES Y APELLIDOS), E (DNI / CE), AF (FECHA DE VIGENCIA ...),
+    AG (ESTATUS DE PROCESO DE HABILITACION) usando los encabezados.
+    """
+    wb = load_workbook(io.BytesIO(xls_bytes), data_only=True, read_only=True)
+    ws = wb[sheet_name] if sheet_name else wb.worksheets[0]
+
+    H = header_row_1based
+    headers = {}
+    # construir mapa de encabezados (posición -> texto normalizado)
+    for col in range(1, ws.max_column + 1):
+        val = ws.cell(row=H, column=col).value
+        headers[col] = normalize(val)
+
+    # buscamos las columnas por NOMBRE de encabezado (tolerante a espacios)
+    need = {
+        "NOMBRES Y APELLIDOS": None,        # col D
+        "DNI / CE": None,                   # col E
+        "FECHA DE VIGENCIA DE HABILITACIÓN DE LICENCIA INTERNA": None,  # col AF
+        "ESTATUS DE PROCESO DE HABILITACION": None,                      # col AG
+    }
+
+    for col, text in headers.items():
+        for k in list(need.keys()):
+            # match exacto tras normalizar
+            if text == normalize(k):
+                need[k] = col
+
+    missing = [k for k, v in need.items() if v is None]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "Faltan columnas requeridas por encabezado", "missing": missing, "encabezados": list(headers.values())}
+        )
+
+    col_name = need["NOMBRES Y APELLIDOS"]
+    col_dni  = need["DNI / CE"]
+    col_fvig = need["FECHA DE VIGENCIA DE HABILITACIÓN DE LICENCIA INTERNA"]
+    col_stat = need["ESTATUS DE PROCESO DE HABILITACION"]
+
+    dni_value_norm = normalize(dni_value)
+
+    # recorrer filas de datos
+    for row in range(H + 1, ws.max_row + 1):
+        cell_dni = normalize(ws.cell(row=row, column=col_dni).value)
+        if cell_dni == dni_value_norm:
+            nombres = ws.cell(row=row, column=col_name).value
+            fecha_vig = ws.cell(row=row, column=col_fvig).value
+            estatus = ws.cell(row=row, column=col_stat).value
+            return {
+                "NOMBRES_Y_APELLIDOS": str(nombres or "").strip(),
+                "DNI_CE": dni_value_norm,
+                "FECHA_VIGENCIA_LICENCIA_INTERNA": str(fecha_vig or "").strip(),
+                "ESTATUS_PROCESO_HABILITACION": str(estatus or "").strip(),
+            }
+
+    raise HTTPException(status_code=404, detail="Conductor no encontrado por DNI en la columna E")
+
+# ===== endpoints =====
+
+@app.get("/health")
+def health():
+    return {"ok": True, "ts": int(time.time())}
+
+@app.get("/driver")
+def get_driver(
+    doc: str = Query(..., description="DNI/CE exacto tal como aparece en la columna E"),
+    t: str   = Query(..., description="token HMAC"),
+    sheet_name: Optional[str] = Query(None, description="Nombre de hoja. Vacío = primera"),
+    header_row: int = Query(12, description="Fila de encabezados, 1-based"),
+):
+    SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
+    ONEDRIVE_URL = os.getenv("ONEDRIVE_URL", "").strip()
+
+    if not SECRET_KEY or not ONEDRIVE_URL:
+        raise HTTPException(status_code=500, detail="Faltan variables de entorno: SECRET_KEY y/o ONEDRIVE_URL")
+
+    # 1) verificar token
+    if not verify(doc, t, SECRET_KEY):
+        raise HTTPException(status_code=401, detail="token inválido")
+
+    # 2) descargar Excel fresco
+    url = od_to_download(ONEDRIVE_URL)
+    url = f"{url}{'&' if '?' in url else '?'}_cb={int(time.time())}"
+    r = requests.get(url, timeout=60, headers={"Cache-Control": "no-cache"})
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"No pude descargar Excel ({r.status_code})")
+
+    # 3) parsear Excel sin pandas
+    data = read_driver_from_excel(r.content, sheet_name, header_row, doc)
+    return JSONResponse({"ok": True, "driver": data})
+
+# NOTA: El Procfile en Render arrancará uvicorn/gunicorn como siempre.
